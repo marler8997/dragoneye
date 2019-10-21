@@ -1,0 +1,184 @@
+#!/usr/bin/env python
+import sys
+import os
+import time
+import subprocess
+import json
+import urllib.parse
+import http.server
+import html
+
+if sys.version_info[0] < 3:
+    sys.exit("Error: require python version >= 3 but got {}".format(sys.version))
+
+
+class Service:
+    def __init__(self, name, func):
+        self.name = name
+        self.func = func
+
+def make_service_error(msg):
+    return {'error':msg}
+
+def service_listdir(path):
+    if len(path) != 1:
+        return make_service_error("listdir only accepts 1 path")
+    path = path[0]
+    if path.startswith('/'):
+        return make_service_error("listdir does not accept absolute paths")
+    # TODO: sanitize path
+    if '.' in path:
+        return make_service_error("path may not contain '.' characters")
+    dirs = []
+    files = []
+    fs_path = "webroot/" + path
+    for basename in os.listdir(fs_path):
+        fullname = os.path.join(fs_path, basename)
+        if os.path.isdir(fullname):
+            dirs.append(basename)
+        elif os.path.isfile(fullname):
+            files.append(basename)
+        else:
+            return make_service_error("path '{}' is neither a dir nor a file".format(fs_path))
+    return {'dirs' : dirs, 'files' : files}
+
+services = ["listdir"]
+service_map = {}
+for service in services:
+    service_map[service] = globals()["service_" + service]
+
+ELM_PREFIX = "elm/"
+
+def getmtime_or(file, default):
+    try:
+        return os.path.getmtime(file)
+    except FileNotFoundError:
+        return default
+
+def make_elm_js_error(module, msg):
+    return b"""
+var Elm = {
+    """ + module.encode('utf8') + b""" : {
+        init : function(args) {
+            args.node.innerHTML = """ + json.dumps(msg).encode('utf8') + b""";
+        }
+    }
+};
+"""
+    
+def get_elm_js(url_path, file_path):
+    # TODO: handle this more gracefully
+    module = url_path[len(ELM_PREFIX) : -3]
+    if not url_path.endswith('.js'):
+        return make_elm_js_error(module, "elm path '{}' does not end with '.js'".format(url_path))
+    srcpath = "src/" + module + ".elm"
+    if not os.path.exists(srcpath):
+        return make_elm_js_error(module, "javascript file '{}' does not have a corresponding elm file in '{}'".format(url_path, srcpath))
+
+    if os.path.getmtime(srcpath) > getmtime_or(file_path, 0):
+        cmd = ["elm", "make", srcpath, "--output=" + file_path]
+        print("[RUN] {}".format(cmd))
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode != 0:
+            return make_elm_js_error(module, '<h1>STDOUT</h1><pre>{}</pre><h1>STDERR</h1><pre>{}</pre>'
+                                 .format(html.escape(result.stdout.decode('utf8')),
+                                         html.escape(result.stderr.decode('utf8'))))
+    with open(file_path, "rb") as file:
+        return file.read()
+
+def make_elm_html(module):
+    module_bytes = module.encode('utf8')
+    return b"""<!DOCTYPE HTML>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>DragonEye - """ + module_bytes + b"""</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="elm/""" + module_bytes + b""".js"></script>
+</head>
+<body>
+  <div id="ElmDiv"></div>
+  <script>
+    var app = Elm.""" + module_bytes +  b""".init({
+        node: document.getElementById('ElmDiv'),
+        flags: ""
+    });
+  </script>
+</body>
+</html>
+"""
+
+class Handler (http.server.BaseHTTPRequestHandler):
+    def _send_html(self, code, message, add_debug_info=False):
+        self.send_response(code)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        debug_info = ""
+        if add_debug_info:
+            debug_info = "<pre>vars(self) = {}</pre>".format(vars(self))
+        self.wfile.write("<html><title>Error {}</title><body>{}{}</body></html>"
+                         .format(code, message, debug_info).encode('utf8'))
+
+
+    def _send_service_response(self, code, obj):
+        self.send_response(code)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(obj).encode('utf8'))
+        
+    def do_GET(self):
+        parsed_url = urllib.parse.urlparse(self.path)
+        url_path = parsed_url.path.lstrip('/')
+        if len(url_path) == 0:
+            url_path = "DragonEye.elm"
+
+        if url_path.startswith("service/"):
+            service_name = url_path[len("service/"):]
+            service_func = service_map.get(service_name, None)
+            if not service_func:
+                self._send_service_response(
+                    404, make_service_error("unknown service 'service/{}'".format(service_name)))
+                return
+            try:
+                #print("{}".format(parsed_url))
+                query_params = urllib.parse.parse_qs(parsed_url.query)
+                #print("query_params = {}".format(query_params))
+                self._send_service_response(200, service_func(**query_params))
+            except Exception as e:
+                self._send_service_response(
+                    200, make_service_error("service/{} failed with: {}".format(service_name, str(e))))
+            return
+
+        file_path = "webroot/" + url_path
+
+        content_type = None
+        if url_path.startswith(ELM_PREFIX):
+            content = get_elm_js(url_path, file_path)
+        elif url_path.endswith(".elm"):
+            content = make_elm_html(url_path[:-len(".elm")])
+            content_type = "text/html"
+        else:
+            try:
+                # TODO: should I use mmap?
+                with open(file_path, "rb") as file:
+                    content = file.read()
+            except FileNotFoundError:
+                self._send_html(404, "path '{}' is not found".format(url_path), True)
+                return
+
+        self.send_response(200)
+        if content_type:
+            self.send_header('Content-Type', content_type)
+        elif url_path.endswith(".html"):
+            self.send_header('Content-Type', 'text/html')
+        elif url_path.endswith(".js"):
+            self.send_header('Content-Type', 'text/javascript')
+        elif url_path.endswith(".css"):
+            self.send_header('Content-Type', 'text/css')
+        self.end_headers()
+        self.wfile.write(content)
+        
+
+server_address = ('0.0.0.0', 8001)
+httpd = http.server.HTTPServer(server_address,  Handler)
+httpd.serve_forever()

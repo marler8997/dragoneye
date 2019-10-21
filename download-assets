@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -e
+dir=$(dirname $(realpath ${BASH_SOURCE[0]}))
+
+echorun() {
+    echo $@
+    $@
+}
+
+assets=(
+    $dir/webroot/map/arena.jpg https://marler8997.github.io/dragoneye_assets/arena.jpg
+    $dir/webroot/pic/dragonfight.jpg https://marler8997.github.io/dragoneye_assets/dragonfight.jpg
+    $dir/webroot/pic/dragoneye-logo.png https://marler8997.github.io/dragoneye_assets/dragoneye-logo.png
+)
+for (( i=0; i<${#assets[@]} ; i+=2 )); do
+    asset=${assets[i]}
+    url=${assets[i+1]}
+    if [ -e $asset ]; then
+        echo Already downloaded $asset
+    else
+        echo Missing $asset, downloading from $url
+        echorun mkdir -p $(dirname $asset)
+        echorun wget --output-document=${asset}.downloading $url
+        echorun mv ${asset}.downloading $asset
+    fi
+done

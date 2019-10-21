@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -x
+dir=$(dirname $(realpath ${BASH_SOURCE[0]}))
+set -e
+elm-format --yes src/DragonEye.elm
